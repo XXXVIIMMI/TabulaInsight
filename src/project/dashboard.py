@@ -30,7 +30,7 @@ THEME = "plotly_white"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━ PAGE CONFIG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 st.set_page_config(
-    page_title="EDA Pro Dashboard",
+    page_title="TabulaInsight Dashboard",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
