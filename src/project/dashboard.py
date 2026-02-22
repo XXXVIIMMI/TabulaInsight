@@ -188,6 +188,8 @@ if is_sampled:
 # ━━━━━━━━━━━━━━━━━━━━━━━━ HELPER ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
+_plotly_counter = iter(range(1, 10_000))
+
 def safe_plotly(fig, **kwargs):
     fig.update_layout(
         template=THEME,
@@ -195,6 +197,7 @@ def safe_plotly(fig, **kwargs):
         margin=dict(t=40, b=30, l=30, r=20),
         colorway=COLOR_PALETTE,
     )
+    kwargs.setdefault("key", f"plotly_{next(_plotly_counter)}")
     st.plotly_chart(fig, use_container_width=True, **kwargs)
 
 
