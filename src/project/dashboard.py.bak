@@ -1,0 +1,481 @@
+import os
+import numpy as np
+import streamlit as st
+import plotly.express as px
+import plotly.figure_factory as ff
+import pandas as pd
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# ──────────────────────────── Page config ────────────────────────────
+st.set_page_config(page_title="EDA Dashboard", page_icon="📊", layout="wide")
+st.title("Exploratory Data Analysis Dashboard 📊")
+st.markdown(
+    "<style>div.block-container{padding-top:1.5rem;}</style>",
+    unsafe_allow_html=True,
+)
+
+# ──────────────────────────── File loader ────────────────────────────
+SUPPORTED = ["csv", "xlsx", "xls", "json", "txt", "tsv", "parquet"]
+
+file = st.file_uploader(
+    ":file_folder: Upload a dataset",
+    type=SUPPORTED,
+    help="Accepts CSV, Excel, JSON, Parquet, TSV and TXT files",
+)
+
+
+@st.cache_data(show_spinner="Loading data …")
+def load_data(uploaded_file):
+    """Read the uploaded file into a DataFrame."""
+    name = uploaded_file.name.lower()
+    if name.endswith((".xlsx", ".xls")):
+        return pd.read_excel(uploaded_file)
+    elif name.endswith(".json"):
+        return pd.read_json(uploaded_file)
+    elif name.endswith(".parquet"):
+        return pd.read_parquet(uploaded_file)
+    else:  # csv / tsv / txt
+        uploaded_file.seek(0)
+        return pd.read_csv(uploaded_file)
+
+
+@st.cache_data(show_spinner="Loading sample data …")
+def load_sample():
+    """Load the bundled Superstore sample so the app is never empty."""
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(current_dir, "../data/Superstore.xls")
+    return pd.read_excel(path)
+
+
+if file is not None:
+    st.write(f"**Loaded file:** `{file.name}`")
+    df = load_data(file)
+else:
+    st.info("No file uploaded — showing bundled Superstore sample data.")
+    df = load_sample()
+
+# ──────────────────────────── Column classification ──────────────────
+numeric_cols = df.select_dtypes(include="number").columns.tolist()
+categorical_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+
+# Auto-detect datetime columns (parse object columns that look like dates)
+datetime_cols = df.select_dtypes(include=["datetime", "datetimetz"]).columns.tolist()
+for col in list(categorical_cols):
+    try:
+        parsed = pd.to_datetime(df[col], infer_datetime_format=True, errors="coerce")
+        if parsed.notna().mean() > 0.8:  # >80 % parsed → treat as date
+            df[col] = parsed
+            datetime_cols.append(col)
+            categorical_cols.remove(col)
+    except Exception:
+        pass
+
+# ──────────────────────────── Sidebar filters ────────────────────────
+st.sidebar.header("🔍 Filters")
+
+# Date range filter (if any datetime column exists)
+date_col = None
+if datetime_cols:
+    date_col = st.sidebar.selectbox("Date column", datetime_cols)
+    min_date = df[date_col].min()
+    max_date = df[date_col].max()
+    date_range = st.sidebar.date_input(
+        "Date range",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date,
+    )
+    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+        df = df[
+            (df[date_col] >= pd.to_datetime(date_range[0]))
+            & (df[date_col] <= pd.to_datetime(date_range[1]))
+        ].copy()
+
+# Categorical filters (up to 6 columns to keep sidebar manageable)
+cat_filters: dict[str, list] = {}
+for col in categorical_cols[:6]:
+    unique_vals = df[col].dropna().unique().tolist()
+    if 1 < len(unique_vals) <= 200:  # skip useless or huge selectors
+        selected = st.sidebar.multiselect(f"Filter by {col}", options=unique_vals)
+        if selected:
+            cat_filters[col] = selected
+
+# Apply filters incrementally
+filtered_df = df.copy()
+for col, vals in cat_filters.items():
+    filtered_df = filtered_df[filtered_df[col].isin(vals)]
+
+st.sidebar.markdown("---")
+st.sidebar.write(f"**Rows after filter:** {len(filtered_df):,} / {len(df):,}")
+
+# ──────────────────────── 1. Dataset overview ────────────────────────
+st.subheader("📋 Dataset Overview")
+ov1, ov2, ov3, ov4 = st.columns(4)
+ov1.metric("Rows", f"{filtered_df.shape[0]:,}")
+ov2.metric("Columns", f"{filtered_df.shape[1]:,}")
+ov3.metric("Numeric", len(numeric_cols))
+ov4.metric("Categorical", len(categorical_cols))
+
+tab_preview, tab_types, tab_stats, tab_missing = st.tabs(
+    ["Preview", "Data Types", "Statistics", "Missing Values"]
+)
+
+with tab_preview:
+    st.dataframe(filtered_df.head(100), use_container_width=True)
+
+with tab_types:
+    dtypes_df = pd.DataFrame(
+        {"Column": df.columns, "Type": df.dtypes.astype(str).values}
+    )
+    st.dataframe(dtypes_df, use_container_width=True, hide_index=True)
+
+with tab_stats:
+    st.dataframe(filtered_df.describe(include="all").T, use_container_width=True)
+
+with tab_missing:
+    miss = df.isnull().sum().reset_index()
+    miss.columns = ["Column", "Missing"]
+    miss["% Missing"] = (miss["Missing"] / len(df) * 100).round(2)
+    miss = miss[miss["Missing"] > 0].sort_values("% Missing", ascending=False)
+    if miss.empty:
+        st.success("No missing values! 🎉")
+    else:
+        st.dataframe(miss, use_container_width=True, hide_index=True)
+        fig = px.bar(miss, x="Column", y="% Missing", text="% Missing", template="seaborn")
+        st.plotly_chart(fig, use_container_width=True)
+
+# ──────────────────── 2. Numeric distributions ───────────────────────
+if numeric_cols:
+    st.subheader("📊 Numeric Distributions")
+    sel_num = st.multiselect(
+        "Choose numeric columns to plot",
+        numeric_cols,
+        default=numeric_cols[:min(4, len(numeric_cols))],
+    )
+    if sel_num:
+        cols = st.columns(min(len(sel_num), 3))
+        for idx, col_name in enumerate(sel_num):
+            with cols[idx % len(cols)]:
+                fig = px.histogram(
+                    filtered_df,
+                    x=col_name,
+                    marginal="box",
+                    template="seaborn",
+                    title=col_name,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+# ──────────────────── 3. Categorical breakdowns ──────────────────────
+if categorical_cols and numeric_cols:
+    st.subheader("📈 Categorical Breakdown")
+    c1, c2 = st.columns(2)
+    with c1:
+        cat_col = st.selectbox("Category column", categorical_cols, key="cat_brk")
+    with c2:
+        num_col = st.selectbox("Value column (sum)", numeric_cols, key="num_brk")
+
+    grp = filtered_df.groupby(cat_col, as_index=False)[num_col].sum().sort_values(num_col, ascending=False)
+
+    col_bar, col_pie = st.columns(2)
+    with col_bar:
+        fig = px.bar(
+            grp.head(20),
+            x=cat_col,
+            y=num_col,
+            text_auto=",.2f",
+            template="seaborn",
+            title=f"{num_col} by {cat_col} (Bar)",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    with col_pie:
+        fig = px.pie(
+            grp.head(10),
+            names=cat_col,
+            values=num_col,
+            hole=0.4,
+            title=f"{num_col} by {cat_col} (Pie)",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander(f"View grouped data ({cat_col})"):
+        st.dataframe(grp.style.background_gradient(cmap="Blues"), use_container_width=True)
+
+# ──────────────────── 4. Time series analysis ────────────────────────
+if datetime_cols and numeric_cols:
+    st.subheader("📅 Time Series Analysis")
+    ts1, ts2 = st.columns(2)
+    with ts1:
+        ts_date = st.selectbox("Date column", datetime_cols, key="ts_date")
+    with ts2:
+        ts_val = st.selectbox("Value column", numeric_cols, key="ts_val")
+
+    ts_df = filtered_df.dropna(subset=[ts_date, ts_val]).copy()
+    ts_df["_period"] = ts_df[ts_date].dt.to_period("M").dt.to_timestamp()
+    line_data = ts_df.groupby("_period", as_index=False)[ts_val].sum()
+
+    fig = px.line(
+        line_data,
+        x="_period",
+        y=ts_val,
+        labels={"_period": "Month", ts_val: ts_val},
+        template="gridon",
+        title=f"{ts_val} over time",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("View time-series data"):
+        st.dataframe(line_data, use_container_width=True)
+
+# ──────────────────── 5. Correlation heatmap ─────────────────────────
+if len(numeric_cols) >= 2:
+    st.subheader("🔥 Correlation Heatmap")
+    corr = filtered_df[numeric_cols].corr()
+    fig = px.imshow(
+        corr,
+        text_auto=".2f",
+        color_continuous_scale="RdBu_r",
+        aspect="auto",
+        title="Pearson Correlation",
+    )
+    fig.update_layout(height=500)
+    st.plotly_chart(fig, use_container_width=True)
+
+# ──────────────────── 6. Scatter plot explorer ───────────────────────
+if len(numeric_cols) >= 2:
+    st.subheader("🔵 Scatter Plot Explorer")
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    with sc1:
+        x_col = st.selectbox("X axis", numeric_cols, index=0, key="sc_x")
+    with sc2:
+        y_col = st.selectbox("Y axis", numeric_cols, index=min(1, len(numeric_cols) - 1), key="sc_y")
+    with sc3:
+        color_col = st.selectbox(
+            "Color by (optional)",
+            [None] + categorical_cols,
+            index=0,
+            key="sc_color",
+        )
+    with sc4:
+        size_col = st.selectbox(
+            "Size by (optional)",
+            [None] + numeric_cols,
+            index=0,
+            key="sc_size",
+        )
+
+    scatter_kwargs = dict(
+        x=x_col, y=y_col, opacity=0.6, template="seaborn",
+        title=f"{y_col} vs {x_col}",
+        trendline="ols" if len(filtered_df) < 50_000 else None,
+    )
+    if color_col:
+        scatter_kwargs["color"] = color_col
+    if size_col:
+        scatter_kwargs["size"] = size_col
+        scatter_kwargs["size_max"] = 20
+
+    fig = px.scatter(filtered_df, **scatter_kwargs)
+    st.plotly_chart(fig, use_container_width=True)
+
+# ──────────────────── 7. Box / Violin comparison ─────────────────────
+if numeric_cols and categorical_cols:
+    st.subheader("🎻 Box & Violin Comparison")
+    bv1, bv2, bv3 = st.columns(3)
+    with bv1:
+        bv_num = st.selectbox("Numeric column", numeric_cols, key="bv_num")
+    with bv2:
+        bv_cat = st.selectbox("Group by", categorical_cols, key="bv_cat")
+    with bv3:
+        bv_mode = st.radio("Chart type", ["Box", "Violin"], horizontal=True, key="bv_mode")
+
+    bv_data = filtered_df.dropna(subset=[bv_num, bv_cat])
+    # Limit to top 15 categories for readability
+    top_cats = bv_data[bv_cat].value_counts().head(15).index
+    bv_data = bv_data[bv_data[bv_cat].isin(top_cats)]
+
+    if bv_mode == "Box":
+        fig = px.box(bv_data, x=bv_cat, y=bv_num, color=bv_cat,
+                     template="seaborn", title=f"{bv_num} distribution by {bv_cat}")
+    else:
+        fig = px.violin(bv_data, x=bv_cat, y=bv_num, color=bv_cat, box=True,
+                        template="seaborn", title=f"{bv_num} distribution by {bv_cat}")
+    fig.update_layout(showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+# ──────────────────── 8. Outlier detection ───────────────────────────
+if numeric_cols:
+    st.subheader("🚨 Outlier Detection (IQR Method)")
+    out_col = st.selectbox("Select column", numeric_cols, key="out_col")
+    q1 = filtered_df[out_col].quantile(0.25)
+    q3 = filtered_df[out_col].quantile(0.75)
+    iqr = q3 - q1
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    outliers = filtered_df[(filtered_df[out_col] < lower) | (filtered_df[out_col] > upper)]
+
+    om1, om2, om3, om4 = st.columns(4)
+    om1.metric("Q1", f"{q1:,.2f}")
+    om2.metric("Q3", f"{q3:,.2f}")
+    om3.metric("IQR", f"{iqr:,.2f}")
+    om4.metric("Outliers", f"{len(outliers):,} ({len(outliers)/max(len(filtered_df),1)*100:.1f}%)")
+
+    fig = px.box(filtered_df, y=out_col, points="outliers", template="seaborn",
+                 title=f"Outliers in {out_col}  (below {lower:,.2f} or above {upper:,.2f})")
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander(f"View {len(outliers)} outlier rows"):
+        st.dataframe(outliers, use_container_width=True)
+
+# ──────────────────── 9. Top-N value counts ──────────────────────────
+if categorical_cols:
+    st.subheader("🏆 Top-N Value Counts")
+    tn1, tn2 = st.columns(2)
+    with tn1:
+        tn_col = st.selectbox("Column", categorical_cols, key="tn_col")
+    with tn2:
+        top_n = st.slider("Show top N", min_value=5, max_value=50, value=10, key="tn_n")
+
+    vc = filtered_df[tn_col].value_counts().head(top_n).reset_index()
+    vc.columns = [tn_col, "Count"]
+
+    tn_bar, tn_pie = st.columns(2)
+    with tn_bar:
+        fig = px.bar(vc, x=tn_col, y="Count", text_auto=True, template="seaborn",
+                     title=f"Top {top_n} — {tn_col}")
+        st.plotly_chart(fig, use_container_width=True)
+    with tn_pie:
+        fig = px.pie(vc, names=tn_col, values="Count", hole=0.35,
+                     title=f"Top {top_n} — {tn_col} (share)")
+        st.plotly_chart(fig, use_container_width=True)
+
+# ──────────────────── 10. Treemap / Sunburst ─────────────────────────
+if len(categorical_cols) >= 2 and numeric_cols:
+    st.subheader("🌳 Treemap & Sunburst")
+    tr1, tr2, tr3 = st.columns(3)
+    with tr1:
+        tree_cols = st.multiselect(
+            "Hierarchy levels (order matters)",
+            categorical_cols,
+            default=categorical_cols[:min(2, len(categorical_cols))],
+            key="tree_lvl",
+        )
+    with tr2:
+        tree_val = st.selectbox("Value column", numeric_cols, key="tree_val")
+    with tr3:
+        tree_mode = st.radio("Chart", ["Treemap", "Sunburst"], horizontal=True, key="tree_mode")
+
+    if tree_cols:
+        tree_data = filtered_df.dropna(subset=tree_cols + [tree_val])
+        if tree_mode == "Treemap":
+            fig = px.treemap(tree_data, path=tree_cols, values=tree_val,
+                             color=tree_val, color_continuous_scale="Viridis",
+                             title=f"Treemap of {tree_val} by {' → '.join(tree_cols)}")
+        else:
+            fig = px.sunburst(tree_data, path=tree_cols, values=tree_val,
+                              color=tree_val, color_continuous_scale="Viridis",
+                              title=f"Sunburst of {tree_val} by {' → '.join(tree_cols)}")
+        fig.update_layout(height=650)
+        st.plotly_chart(fig, use_container_width=True)
+
+# ──────────────────── 11. Pair plot (scatter matrix) ─────────────────
+if len(numeric_cols) >= 2:
+    st.subheader("🔗 Pair Plot (Scatter Matrix)")
+    pair_cols = st.multiselect(
+        "Select columns (2-5 recommended)",
+        numeric_cols,
+        default=numeric_cols[:min(3, len(numeric_cols))],
+        key="pair_cols",
+    )
+    pair_color = st.selectbox("Color by (optional)", [None] + categorical_cols, key="pair_color")
+
+    if len(pair_cols) >= 2:
+        sample_df = filtered_df if len(filtered_df) < 5000 else filtered_df.sample(5000, random_state=42)
+        fig = px.scatter_matrix(
+            sample_df,
+            dimensions=pair_cols,
+            color=pair_color if pair_color else None,
+            opacity=0.5,
+            title="Scatter Matrix",
+        )
+        fig.update_layout(height=700)
+        fig.update_traces(diagonal_visible=True)
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("Select at least 2 numeric columns.")
+
+# ──────────────────── 12. Grouped aggregation table ──────────────────
+if categorical_cols and numeric_cols:
+    st.subheader("📊 Grouped Aggregation Table")
+    ga1, ga2, ga3 = st.columns(3)
+    with ga1:
+        ga_group = st.multiselect("Group by", categorical_cols,
+                                   default=[categorical_cols[0]], key="ga_grp")
+    with ga2:
+        ga_vals = st.multiselect("Value columns", numeric_cols,
+                                  default=numeric_cols[:min(2, len(numeric_cols))], key="ga_vals")
+    with ga3:
+        ga_agg = st.selectbox("Aggregation", ["sum", "mean", "median", "count", "min", "max"], key="ga_agg")
+
+    if ga_group and ga_vals:
+        agg_df = filtered_df.groupby(ga_group, as_index=False)[ga_vals].agg(ga_agg)
+        st.dataframe(agg_df.style.background_gradient(cmap="YlGnBu"), use_container_width=True)
+
+        # Stacked / grouped bar chart for first value column
+        if len(ga_group) == 1:
+            fig = px.bar(agg_df.sort_values(ga_vals[0], ascending=False).head(20),
+                         x=ga_group[0], y=ga_vals[0], text_auto=",.2f",
+                         template="seaborn", title=f"{ga_agg.title()} of {ga_vals[0]} by {ga_group[0]}")
+            st.plotly_chart(fig, use_container_width=True)
+        elif len(ga_group) >= 2:
+            fig = px.bar(agg_df.sort_values(ga_vals[0], ascending=False).head(30),
+                         x=ga_group[0], y=ga_vals[0], color=ga_group[1],
+                         barmode="group", text_auto=",.0f", template="seaborn",
+                         title=f"{ga_agg.title()} of {ga_vals[0]} by {ga_group[0]} & {ga_group[1]}")
+            st.plotly_chart(fig, use_container_width=True)
+
+        csv_agg = agg_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download aggregation", data=csv_agg,
+                           file_name="aggregation.csv", mime="text/csv", key="dl_agg")
+
+# ──────────────────── 13. Cumulative / area chart ────────────────────
+if datetime_cols and numeric_cols:
+    st.subheader("📈 Cumulative Trend")
+    cu1, cu2 = st.columns(2)
+    with cu1:
+        cu_date = st.selectbox("Date column", datetime_cols, key="cu_date")
+    with cu2:
+        cu_val = st.selectbox("Value column", numeric_cols, key="cu_val")
+
+    cu_df = filtered_df.dropna(subset=[cu_date, cu_val]).copy()
+    cu_df["_period"] = cu_df[cu_date].dt.to_period("M").dt.to_timestamp()
+    cu_line = cu_df.groupby("_period", as_index=False)[cu_val].sum()
+    cu_line["Cumulative"] = cu_line[cu_val].cumsum()
+
+    fig = px.area(cu_line, x="_period", y="Cumulative",
+                  labels={"_period": "Month", "Cumulative": f"Cumulative {cu_val}"},
+                  template="gridon", title=f"Cumulative {cu_val} over time")
+    st.plotly_chart(fig, use_container_width=True)
+
+# ──────────────────── 14. Download section ───────────────────────────
+st.markdown("---")
+st.subheader("⬇️ Download Filtered Data")
+dl1, dl2 = st.columns(2)
+with dl1:
+    csv_data = filtered_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download CSV",
+        data=csv_data,
+        file_name="filtered_data.csv",
+        mime="text/csv",
+    )
+with dl2:
+    # Provide JSON download as well
+    json_data = filtered_df.to_json(orient="records", date_format="iso").encode("utf-8")
+    st.download_button(
+        "Download JSON",
+        data=json_data,
+        file_name="filtered_data.json",
+        mime="application/json",
+    )
